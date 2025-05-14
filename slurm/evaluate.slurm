@@ -1,7 +1,12 @@
 #!/bin/bash
+#SBATCH --job-name=open-r1-eval
+#SBATCH --nodes=1
+#SBATCH --gpus-per-node=4
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
-#SBATCH --partition=hopper-prod
+#SBATCH --time=12:00:00
+#SBATCH --partition=capella
 #SBATCH --output=./logs/%x-%j.out
 #SBATCH --error=./logs/%x-%j.err
 #SBATCH --requeue
