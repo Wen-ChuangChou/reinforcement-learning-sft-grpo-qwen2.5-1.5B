@@ -177,6 +177,7 @@ logs/
 eval_results/
 results/
 Qwen/
+trained_models/
 
 .vscode/
 .python-version

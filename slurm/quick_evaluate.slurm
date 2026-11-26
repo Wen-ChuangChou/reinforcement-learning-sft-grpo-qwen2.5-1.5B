@@ -11,10 +11,12 @@
 #SBATCH --err=./logs/%x-%j.err
 #SBATCH --mail-user=wen-chuang.chou@tu-dresden.de
 #SBATCH --mail-type=ALL
+#SBATCH --licenses=cat # Special license requirement for Capella Partition
+#SBATCH --exclusive
 
 # sbatch slurm/quick_evaluate.slurm math_500 data/OpenR1-Distill-7B_Math-220k
 # Test tasks: aime24, math_500, gpqa:diamond, codegeneration
-# Test models: data/OpenR1-Distill-7B_Math-220k, data/OpenR1-Distill-7B, Qwen/Qwen2.5-Math-7B-Instruct, deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+# Test models: data/OpenR1-Distill-7B_Math-220k, data/OpenR1-Distill-7B, Qwen/Qwen2.5-Math-7B-Instruct, deepseek-ai/DeepSeek-R1-Distill-Qwen-7B, trained_models/Qwen2.5-1.5B-Open-R1-GRPO
 
 module load release/24.04  GCCcore/13.2.0 Python/3.11.5 CUDA/12.4.0
 source env/openr1/bin/activate

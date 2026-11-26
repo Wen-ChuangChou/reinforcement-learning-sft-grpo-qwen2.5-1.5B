@@ -1,6 +1,6 @@
 #!/bin/bash
 ### SLURM job submission example:
-### sbatch --nodes=2 slurm/my_train.slurm --model Qwen2.5-1.5B-Instruct --task grpo --config TUD --accelerator zero3 --dp 4 --tp 1
+### sbatch slurm/my_train.slurm --model Qwen2.5-1.5B-Instruct --task grpo --config TUD --accelerator zero3 --dp 4 --tp 1
 ### where parameters are:
 ### model: Qwen2.5-1.5B-Instruct
 ### task: grpo
@@ -16,15 +16,15 @@
 ####SBATCH --cpus-per-task=8
 #SBATCH --cpus-per-task=6
 #####SBATCH --mem=128G
-#SBATCH --mem=144G
-#####SBATCH --time=30:00:00
-#SBATCH --time=24:00:00
+#SBATCH --mem=32G
+#SBATCH --time=10:00:00
 #SBATCH --partition=capella  # Adjust this for your cluster
 #SBATCH --output=./logs/%x-%j.out
 #SBATCH --error=./logs/%x-%j.err
 #SBATCH --mail-user=wen-chuang.chou@tu-dresden.de
 #SBATCH --mail-type=ALL
-#SBATCH --licenses=cat
+#SBATCH --licenses=cat # Special license requirement for Capella Partition
+#SBATCH --exclusive
 
 
 if [[ "$*" == *"--help"* ]]; then
