@@ -176,8 +176,8 @@ wandb/
 logs/
 eval_results/
 results/
-archive/
 Qwen/
+trained_models/
 
 .vscode/
 .python-version

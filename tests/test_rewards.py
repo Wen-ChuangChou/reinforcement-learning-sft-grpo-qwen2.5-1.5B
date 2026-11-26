@@ -13,11 +13,15 @@
 # limitations under the License.
 
 
+import os
+import time
 import unittest
+from unittest.mock import patch
 
 from dotenv import load_dotenv
 from open_r1.configs import GRPOScriptArguments
 from open_r1.rewards import (
+    _AccuracyEvaluator,
     accuracy_reward,
     format_reward,
     get_code_format_reward,
@@ -96,6 +100,118 @@ class TestRewards(unittest.TestCase):
         solution = ["6"]
         rewards = accuracy_reward(completion, solution)
         self.assertEqual(rewards[0], 0.0)
+
+    def test_accuracy_reward_no_fallback_unparseable_gold(self):
+        """Test that unparseable LaTeX gold solutions return None instead of string-fallback matching."""
+        unparseable_gold = [r"$\frac{1}{}$", r"$\frac{1}{}$"]
+        completions = [
+            [{"content": r"\boxed{\frac{1}{}}"}],
+            [{"content": r"\boxed{1}"}],
+        ]
+        rewards = accuracy_reward(completions, unparseable_gold)
+        self.assertEqual(rewards, [None, None])
+
+    def test_accuracy_reward_no_fallback_unparseable_completion(self):
+        """Test that unparseable LaTeX completions fail cleanly with 0.0 reward."""
+        completion = [[{"content": r"\boxed{\frac{1}{}}"}]]
+        solution = [r"\frac{1}{2}"]
+        rewards = accuracy_reward(completion, solution)
+        self.assertEqual(rewards, [0.0])
+
+    def test_accuracy_reward_worker_sigkill_recovery(self):
+        """Test that hung or crashed math_verify workers are SIGKILLed and respawned."""
+        worker_script = """
+import json
+import os
+import signal
+import sys
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+proto_fd = os.dup(1)
+os.dup2(2, 1)
+proto_out = os.fdopen(proto_fd, "wb", buffering=0)
+sys.stdout = sys.stderr
+
+from latex2sympy2_extended import NormalizationConfig
+from math_verify import LatexExtractionConfig, parse, verify
+
+answer_cfg = [
+    LatexExtractionConfig(
+        normalization_config=NormalizationConfig(
+            nits=False,
+            malformed_operators=False,
+            basic_latex=True,
+            equations=True,
+            boxed="all",
+            units=True,
+        ),
+        boxed_match_priority=0,
+        try_extract_without_anchor=False,
+    )
+]
+
+proto_out.write(b'{"status": "ready"}\\n')
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    line = line.strip()
+    if not line:
+        continue
+    payload = json.loads(line)
+    sol = payload["sol"]
+    content = payload["content"]
+    if sol == "__hang__":
+        while True:
+            time.sleep(1.0)
+    if sol == "__crash__":
+        os._exit(1)
+    gold = parse(sol, extraction_mode="first_match", fallback_mode="no_fallback")
+    if len(gold) == 0:
+        resp = {"status": "unparseable_gold"}
+    else:
+        ans = parse(content, extraction_config=answer_cfg, extraction_mode="first_match", fallback_mode="no_fallback")
+        resp = {"status": "ok", "reward": float(verify(gold, ans))}
+    proto_out.write((json.dumps(resp) + "\\n").encode("utf-8"))
+"""
+        evaluator = _AccuracyEvaluator(wall_timeout=0.3, startup_timeout=30.0, worker_script=worker_script)
+        self.addCleanup(evaluator.close)
+
+        with patch("open_r1.rewards._ACCURACY_EVALUATOR", evaluator):
+            self.assertEqual(accuracy_reward([[{"content": r"\boxed{\frac{63}{400}}"}]], [r"\frac{63}{400}"]), [1.0])
+            pid_before_hang = evaluator.worker_pid
+            self.assertIsNotNone(pid_before_hang)
+
+            start = time.monotonic()
+            rewards = accuracy_reward(
+                [
+                    [{"content": r"\boxed{\frac{63}{400}}"}],
+                    [{"content": r"\boxed{1}"}],
+                    [{"content": r"\boxed{\frac{64}{400}}"}],
+                ],
+                [r"\frac{63}{400}", "__hang__", r"\frac{63}{400}"],
+            )
+            elapsed = time.monotonic() - start
+
+            self.assertEqual(rewards, [1.0, None, 0.0])
+            self.assertLess(elapsed, 10.0)
+
+            pid_after_hang = evaluator.worker_pid
+            self.assertIsNotNone(pid_after_hang)
+            self.assertNotEqual(pid_after_hang, pid_before_hang)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid_before_hang, 0)
+
+            crash_rewards = accuracy_reward(
+                [[{"content": r"\boxed{1}"}], [{"content": r"\boxed{\frac{63}{400}}"}]],
+                ["__crash__", r"\frac{63}{400}"],
+            )
+            self.assertEqual(crash_rewards, [None, 1.0])
+            self.assertIsNotNone(evaluator.worker_pid)
+            self.assertNotEqual(evaluator.worker_pid, pid_after_hang)
 
     def test_format_reward_correct(self):
         """Test format_reward with correct format."""

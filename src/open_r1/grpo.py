@@ -18,13 +18,12 @@ import sys
 
 import datasets
 import transformers
-from datasets import load_dataset
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from open_r1.configs import GRPOConfig, GRPOScriptArguments
 from open_r1.rewards import get_reward_funcs
-from open_r1.utils import get_model, get_tokenizer
+from open_r1.utils import get_dataset, get_model, get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, TrlParser, get_peft_config
@@ -72,7 +71,7 @@ def main(script_args, training_args, model_args):
         init_wandb_training(training_args)
 
     # Load the dataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    dataset = get_dataset(script_args)
 
     ################
     # Load tokenizer
@@ -141,6 +140,9 @@ def main(script_args, training_args, model_args):
     # Save model and create model card
     ##################################
     logger.info("*** Save model ***")
+    # Align the model's generation config with the tokenizer's eos token
+    # to avoid unbounded generation in the transformers `pipeline()` function
+    trainer.model.generation_config.eos_token_id = tokenizer.eos_token_id
     trainer.save_model(training_args.output_dir)
     logger.info(f"Model saved to {training_args.output_dir}")
 
