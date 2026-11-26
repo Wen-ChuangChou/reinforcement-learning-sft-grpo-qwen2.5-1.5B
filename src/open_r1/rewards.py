@@ -16,9 +16,16 @@
 """Reward functions for GRPO training."""
 
 import asyncio
+import atexit
 import json
 import math
+import os
 import re
+import select
+import subprocess
+import sys
+import threading
+import time
 from functools import partial, update_wrapper
 from typing import Callable, Dict, Literal, Optional
 
@@ -37,96 +44,225 @@ from .utils.competitive_programming import score_submission as cf_score_submissi
 from .utils.competitive_programming import score_subtask
 
 
-# def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
-#     """Reward function that checks if the completion is the same as the ground truth."""
-#     contents = [completion[0]["content"] for completion in completions]
-#     rewards = []
-#     for content, sol in zip(contents, solution):
-#         gold_parsed = parse(
-#             sol,
-#             extraction_mode="first_match",
-#         )
-#         if len(gold_parsed) != 0:
-#             # We require the answer to be provided in correct latex (no malformed operators)
-#             answer_parsed = parse(
-#                 content,
-#                 extraction_config=[
-#                     LatexExtractionConfig(
-#                         normalization_config=NormalizationConfig(
-#                             nits=False,
-#                             malformed_operators=False,
-#                             basic_latex=True,
-#                             equations=True,
-#                             boxed="all",
-#                             units=True,
-#                         ),
-#                         # Ensures that boxed is tried first
-#                         boxed_match_priority=0,
-#                         try_extract_without_anchor=False,
-#                     )
-#                 ],
-#                 extraction_mode="first_match",
-#             )
-#             # Compute binary rewards if verifiable, `None` otherwise to skip this example
-#             try:
-#                 reward = float(verify(gold_parsed, answer_parsed))
-#             except Exception as e:
-#                 print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
-#                 reward = None
-#         else:
-#             # If the gold solution is not parseable, we assign `None` to skip this example
-#             reward = None
-#             print("Failed to parse gold solution: ", sol)
-#         rewards.append(reward)
+_MATH_VERIFY_WORKER_SCRIPT = """
+import json
+import os
+import sys
 
-#     return rewards
+_proto_fd = os.dup(1)
+os.dup2(2, 1)
+_proto_out = os.fdopen(_proto_fd, "wb", buffering=0)
+sys.stdout = sys.stderr
+
+from latex2sympy2_extended import NormalizationConfig
+from math_verify import LatexExtractionConfig, parse, verify
+
+_ANSWER_EXTRACTION_CONFIG = [
+    LatexExtractionConfig(
+        normalization_config=NormalizationConfig(
+            nits=False,
+            malformed_operators=False,
+            basic_latex=True,
+            equations=True,
+            boxed="all",
+            units=True,
+        ),
+        boxed_match_priority=0,
+        try_extract_without_anchor=False,
+    )
+]
+
+_proto_out.write(b'{"status": "ready"}\\n')
+
+while True:
+    _line = sys.stdin.readline()
+    if not _line:
+        break
+    _line = _line.strip()
+    if not _line:
+        continue
+    try:
+        _payload = json.loads(_line)
+        _content = _payload["content"]
+        _sol = _payload["sol"]
+        _gold_parsed = parse(
+            _sol,
+            extraction_mode="first_match",
+            fallback_mode="no_fallback",
+        )
+        if len(_gold_parsed) == 0:
+            _resp = {"status": "unparseable_gold"}
+        else:
+            _answer_parsed = parse(
+                _content,
+                extraction_config=_ANSWER_EXTRACTION_CONFIG,
+                extraction_mode="first_match",
+                fallback_mode="no_fallback",
+            )
+            _reward = float(verify(_gold_parsed, _answer_parsed))
+            _resp = {"status": "ok", "reward": _reward}
+    except Exception as _exc:
+        _resp = {"status": "error", "error": str(_exc)}
+    _proto_out.write((json.dumps(_resp) + "\\n").encode("utf-8"))
+"""
+
+
+class _AccuracyEvaluator:
+    """Runs math_verify parse/verify in an isolated child process with a hard wall-clock timeout."""
+
+    def __init__(
+        self,
+        wall_timeout: float = 15.0,
+        startup_timeout: float = 30.0,
+        worker_script: str = _MATH_VERIFY_WORKER_SCRIPT,
+    ):
+        self.wall_timeout = wall_timeout
+        self.startup_timeout = startup_timeout
+        self._worker_script = worker_script
+        self._lock = threading.Lock()
+        self._proc: Optional[subprocess.Popen] = None
+        self._owner_pid = os.getpid()
+
+    @property
+    def worker_pid(self) -> Optional[int]:
+        """Return the active worker process PID, if any."""
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc.pid
+        return None
+
+    def _ensure_worker(self) -> None:
+        """Start a fresh worker subprocess if missing, exited, or inherited across a fork."""
+        current_pid = os.getpid()
+        if self._owner_pid != current_pid:
+            self._proc = None
+            self._owner_pid = current_pid
+        if self._proc is None or self._proc.poll() is not None:
+            self._kill_worker()
+            self._proc = subprocess.Popen(
+                [sys.executable, "-u", "-c", self._worker_script],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                ready_msg = self._read_response(self.startup_timeout)
+                if ready_msg.get("status") != "ready":
+                    raise RuntimeError(f"Unexpected reward worker startup message: {ready_msg}")
+            except Exception:
+                self._kill_worker()
+                raise
+
+    def _kill_worker(self) -> None:
+        """Force-kill the active worker process with SIGKILL and close its pipes."""
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        for stream in (proc.stdin, proc.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def close(self) -> None:
+        """Gracefully stop the active worker process, falling back to SIGKILL if needed."""
+        with self._lock:
+            proc = self._proc
+            if proc is None:
+                return
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            self._kill_worker()
+
+    def _read_response(self, timeout: float) -> dict:
+        """Read one JSON response line from the worker before timeout expires."""
+        assert self._proc is not None and self._proc.stdout is not None
+        deadline = time.monotonic() + timeout
+        buf = bytearray()
+        fd = self._proc.stdout.fileno()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Operation timed out after {timeout}s!")
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                raise TimeoutError(f"Operation timed out after {timeout}s!")
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                raise EOFError("Reward worker closed stdout unexpectedly")
+            buf.extend(chunk)
+            newline_idx = buf.find(b"\n")
+            if newline_idx != -1:
+                return json.loads(buf[:newline_idx].decode("utf-8"))
+
+    def score(self, content: str, sol: str) -> Optional[float]:
+        """Score a single (completion content, ground truth solution) pair in the isolated worker."""
+        with self._lock:
+            try:
+                self._ensure_worker()
+                assert self._proc is not None and self._proc.stdin is not None
+                request = (json.dumps({"content": content, "sol": sol}) + "\n").encode("utf-8")
+                self._proc.stdin.write(request)
+                self._proc.stdin.flush()
+                response = self._read_response(self.wall_timeout)
+            except Exception as e:
+                print(f"Reward calculation failed: {e}")
+                self._kill_worker()
+                return None
+
+        status = response.get("status")
+        if status == "ok":
+            return response["reward"]
+        if status == "unparseable_gold":
+            print("Failed to parse gold solution: ", sol)
+            return None
+        print(f"Reward calculation failed: {response.get('error', 'unknown worker error')}")
+        return None
+
+
+_ACCURACY_EVALUATOR: Optional[_AccuracyEvaluator] = None
+_ACCURACY_EVALUATOR_LOCK = threading.Lock()
+
+
+def _shutdown_accuracy_evaluator() -> None:
+    """Clean up the global accuracy worker process on interpreter exit."""
+    if _ACCURACY_EVALUATOR is not None:
+        _ACCURACY_EVALUATOR.close()
+
+
+atexit.register(_shutdown_accuracy_evaluator)
+
+
+def _get_accuracy_evaluator() -> _AccuracyEvaluator:
+    """Return the singleton _AccuracyEvaluator for accuracy_reward()."""
+    global _ACCURACY_EVALUATOR
+    with _ACCURACY_EVALUATOR_LOCK:
+        if _ACCURACY_EVALUATOR is None:
+            _ACCURACY_EVALUATOR = _AccuracyEvaluator()
+        return _ACCURACY_EVALUATOR
+
 
 def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
     """Reward function that checks if the completion is the same as the ground truth."""
     contents = [completion[0]["content"] for completion in completions]
-    rewards = []
-    for content, sol in zip(contents, solution):
-        try:
-            # MOVED: parse() calls are now inside the try block to catch Timeouts
-            gold_parsed = parse(
-                sol,
-                extraction_mode="first_match",
-            )
-            if len(gold_parsed) != 0:
-                # We require the answer to be provided in correct latex (no malformed operators)
-                answer_parsed = parse(
-                    content,
-                    extraction_config=[
-                        LatexExtractionConfig(
-                            normalization_config=NormalizationConfig(
-                                nits=False,
-                                malformed_operators=False,
-                                basic_latex=True,
-                                equations=True,
-                                boxed="all",
-                                units=True,
-                            ),
-                            # Ensures that boxed is tried first
-                            boxed_match_priority=0,
-                            try_extract_without_anchor=False,
-                        )
-                    ],
-                    extraction_mode="first_match",
-                )
-                # Compute binary rewards if verifiable
-                reward = float(verify(gold_parsed, answer_parsed))
-            else:
-                # If the gold solution is not parseable, we assign `None` to skip this example
-                reward = None
-                print("Failed to parse gold solution: ", sol)
-        except Exception as e:
-            # This now catches TimeoutError from both parse() and verify()
-            print(f"Reward calculation failed: {e}")
-            reward = None
-            
-        rewards.append(reward)
+    evaluator = _get_accuracy_evaluator()
+    return [evaluator.score(content, sol) for content, sol in zip(contents, solution)]
 
-    return rewards
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
