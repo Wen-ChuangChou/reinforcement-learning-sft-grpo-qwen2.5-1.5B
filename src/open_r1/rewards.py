@@ -74,6 +74,18 @@ _ANSWER_EXTRACTION_CONFIG = [
 
 _proto_out.write(b'{"status": "ready"}\\n')
 
+
+def _normalize_gold_target(_gold: str) -> str:
+    _stripped = _gold.strip()
+    if not _stripped:
+        return _stripped
+    if any(_marker in _stripped for _marker in ("$", "\\\\(", "\\\\[", "\\\\boxed")):
+        return _stripped
+    if _stripped.replace(" ", "").isalpha() and len(_stripped) > 1:
+        return _stripped
+    return f"${_stripped}$"
+
+
 while True:
     _line = sys.stdin.readline()
     if not _line:
@@ -84,7 +96,7 @@ while True:
     try:
         _payload = json.loads(_line)
         _content = _payload["content"]
-        _sol = _payload["sol"]
+        _sol = _normalize_gold_target(_payload["sol"])
         _gold_parsed = parse(
             _sol,
             extraction_mode="first_match",
@@ -257,11 +269,21 @@ def _get_accuracy_evaluator() -> _AccuracyEvaluator:
         return _ACCURACY_EVALUATOR
 
 
-def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[Optional[float]]:
-    """Reward function that checks if the completion is the same as the ground truth."""
+def accuracy_reward(
+    completions: list[list[dict[str, str]]],
+    solution: Optional[list[str]] = None,
+    answer: Optional[list[str]] = None,
+    **kwargs,
+) -> list[Optional[float]]:
+    """Reward function that checks if the completion matches the ground truth answer (or solution if absent)."""
+    gold_targets = answer if answer is not None else solution
+    if gold_targets is None:
+        raise ValueError("accuracy_reward requires either `answer` or `solution` to be provided.")
     contents = [completion[0]["content"] for completion in completions]
     evaluator = _get_accuracy_evaluator()
-    return [evaluator.score(content, sol) for content, sol in zip(contents, solution)]
+    return [
+        evaluator.score(content, "" if gold is None else str(gold)) for content, gold in zip(contents, gold_targets)
+    ]
 
 
 def format_reward(completions, **kwargs):

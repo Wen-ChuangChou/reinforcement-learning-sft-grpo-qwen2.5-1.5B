@@ -118,6 +118,20 @@ class TestRewards(unittest.TestCase):
         rewards = accuracy_reward(completion, solution)
         self.assertEqual(rewards, [0.0])
 
+    def test_accuracy_reward_prefers_answer_column(self):
+        """Test that accuracy_reward grades against `answer` instead of `solution` when provided."""
+        completions = [
+            [{"content": r"\boxed{\frac{\sqrt{2}}{2}}"}],
+            [{"content": r"\boxed{D}"}],
+            [{"content": r"\boxed{wrong}"}],
+            [{"content": r"\boxed{Yes}"}],
+        ]
+        # Deliberately pass unparseable `solution` proofs to confirm `answer` is used instead.
+        unparseable_solutions = [r"$\frac{1}{}$"] * 4
+        answers = [r"\frac{\sqrt{2}}{2}", "D", "D", "Yes"]
+        rewards = accuracy_reward(completions, solution=unparseable_solutions, answer=answers)
+        self.assertEqual(rewards, [1.0, 1.0, 0.0, None])
+
     def test_accuracy_reward_worker_sigkill_recovery(self):
         """Test that hung or crashed math_verify workers are SIGKILLed and respawned."""
         worker_script = """
